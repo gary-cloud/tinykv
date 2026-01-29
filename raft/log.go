@@ -55,8 +55,25 @@ type RaftLog struct {
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
-	// Your Code Here (2A).
-	return nil
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	lastIndex, err := storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	entries, err := storage.Entries(firstIndex, lastIndex+1)
+	if err != nil {
+		panic(err)
+	}
+	return &RaftLog{
+		storage:   storage,
+		committed: firstIndex - 1,
+		applied:   firstIndex - 1,
+		stabled:   lastIndex,
+		entries:   entries,
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -70,30 +87,55 @@ func (l *RaftLog) maybeCompact() {
 // note, exclude any dummy entries from the return value.
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	if len(l.entries) == 0 {
+		return nil
+	}
+	firstIndex := l.entries[0].Index
+	return l.entries[l.stabled-firstIndex+1:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	// Your Code Here (2A).
-	return nil
+	if len(l.entries) == 0 {
+		return nil
+	}
+	firstIndex := l.entries[0].Index
+	if l.committed < firstIndex {
+		return nil
+	}
+	return l.entries[l.applied-firstIndex+1 : l.committed-firstIndex+1]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	// Your Code Here (2A).
-	return 0
+	var snapIndex uint64
+	if !IsEmptySnap(l.pendingSnapshot) {
+		snapIndex = l.pendingSnapshot.Metadata.Index
+	}
+	if len(l.entries) > 0 {
+		return max(l.entries[len(l.entries)-1].Index, snapIndex)
+	}
+	index, _ := l.storage.LastIndex()
+	return max(index, snapIndex)
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// Your Code Here (2A).
-	return 0, nil
+	if !IsEmptySnap(l.pendingSnapshot) {
+		if i == l.pendingSnapshot.Metadata.Index {
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+	}
+	if len(l.entries) > 0 {
+		firstIndex := l.entries[0].Index
+		if i >= firstIndex && i <= l.entries[len(l.entries)-1].Index {
+			return l.entries[i-firstIndex].Term, nil
+		}
+	}
+	return l.storage.Term(i)
 }
