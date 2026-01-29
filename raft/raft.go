@@ -276,6 +276,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Lead = lead
 	r.electionElapsed = 0
 	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+	r.leadTransferee = None
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -440,11 +441,22 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		r.Prs[id] = &Progress{Next: 1}
+	}
+	r.PendingConfIndex = None
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; ok {
+		delete(r.Prs, id)
+		if r.State == StateLeader && len(r.Prs) > 0 {
+			r.maybeCommit()
+		}
+	}
+	r.PendingConfIndex = None
 }
 
 // stepFollower handles messages for follower state
@@ -460,6 +472,15 @@ func (r *Raft) stepFollower(m pb.Message) {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTimeoutNow:
+		if _, ok := r.Prs[r.id]; ok {
+			r.campaign()
+		}
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
 	}
 }
 
@@ -481,6 +502,8 @@ func (r *Raft) stepCandidate(m pb.Message) {
 	case pb.MessageType_MsgSnapshot:
 		r.becomeFollower(m.Term, m.From)
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTimeoutNow:
+		r.campaign()
 	}
 }
 
@@ -490,6 +513,9 @@ func (r *Raft) stepLeader(m pb.Message) {
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
 	case pb.MessageType_MsgPropose:
+		if r.leadTransferee != None {
+			return
+		}
 		r.appendEntries(m.Entries)
 		r.bcastAppend()
 	case pb.MessageType_MsgAppend:
@@ -502,6 +528,8 @@ func (r *Raft) stepLeader(m pb.Message) {
 		}
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 }
 
@@ -561,7 +589,9 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 		}
 	}
 	if granted > len(r.Prs)/2 {
-		r.becomeLeader()
+		if _, ok := r.Prs[r.id]; ok {
+			r.becomeLeader()
+		}
 	} else if len(r.votes)-granted > len(r.Prs)/2 {
 		r.becomeFollower(r.Term, None)
 	}
@@ -610,6 +640,38 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	r.Prs[m.From].Match = m.Index
 	r.Prs[m.From].Next = m.Index + 1
 	r.maybeCommit()
+	if r.leadTransferee == m.From && r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(m.From)
+	}
+}
+
+// handleTransferLeader handles leader transfer request
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	transferee := m.From
+	if _, ok := r.Prs[transferee]; !ok {
+		return
+	}
+	if transferee == r.id {
+		return
+	}
+	if r.leadTransferee == transferee {
+		return
+	}
+	r.leadTransferee = transferee
+	if r.Prs[transferee].Match == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(transferee)
+	} else {
+		r.sendAppend(transferee)
+	}
+}
+
+// sendTimeoutNow sends MsgTimeoutNow to the given peer
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		To:      to,
+		From:    r.id,
+	})
 }
 
 // maybeCommit updates commit index if possible

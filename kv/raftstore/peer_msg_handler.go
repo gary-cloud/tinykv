@@ -641,7 +641,11 @@ func newCompactLogRequest(regionID uint64, peer *metapb.Peer, compactIndex, comp
 
 func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
 	if entry.EntryType == eraftpb.EntryType_EntryConfChange {
-		// Handle conf change in 3A
+		cc := &eraftpb.ConfChange{}
+		if err := cc.Unmarshal(entry.Data); err != nil {
+			log.Panicf("%s unmarshal conf change error: %v", d.Tag, err)
+		}
+		d.processConfChange(entry, cc, kvWB)
 		return kvWB
 	}
 
@@ -660,6 +664,121 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 	}
 
 	return d.processNormalRequest(entry, msg, kvWB)
+}
+
+func (d *peerMsgHandler) processConfChange(entry *eraftpb.Entry, cc *eraftpb.ConfChange, kvWB *engine_util.WriteBatch) {
+	msg := &raft_cmdpb.RaftCmdRequest{}
+	if err := msg.Unmarshal(cc.Context); err != nil {
+		log.Panicf("%s unmarshal conf change context error: %v", d.Tag, err)
+	}
+
+	region := d.Region()
+	changePeerReq := msg.AdminRequest.ChangePeer
+
+	// Check region epoch
+	if err := util.CheckRegionEpoch(msg, region, true); err != nil {
+		log.Infof("%s conf change check region epoch failed: %v", d.Tag, err)
+		d.notifyConfChangeCallback(entry, cc, ErrResp(err))
+		return
+	}
+
+	switch cc.ChangeType {
+	case eraftpb.ConfChangeType_AddNode:
+		// Add peer to region
+		for _, p := range region.Peers {
+			if p.Id == cc.NodeId {
+				// Peer already exists
+				d.notifyConfChangeCallback(entry, cc, &raft_cmdpb.RaftCmdResponse{
+					Header: &raft_cmdpb.RaftResponseHeader{},
+					AdminResponse: &raft_cmdpb.AdminResponse{
+						CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+						ChangePeer: &raft_cmdpb.ChangePeerResponse{Region: region},
+					},
+				})
+				d.RaftGroup.ApplyConfChange(*cc)
+				return
+			}
+		}
+		newPeer := changePeerReq.Peer
+		region.Peers = append(region.Peers, newPeer)
+		region.RegionEpoch.ConfVer++
+		d.insertPeerCache(newPeer)
+
+	case eraftpb.ConfChangeType_RemoveNode:
+		// Remove peer from region
+		if cc.NodeId == d.PeerId() {
+			d.destroyPeer()
+			return
+		}
+		found := false
+		for i, p := range region.Peers {
+			if p.Id == cc.NodeId {
+				region.Peers = append(region.Peers[:i], region.Peers[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			d.notifyConfChangeCallback(entry, cc, &raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{},
+				AdminResponse: &raft_cmdpb.AdminResponse{
+					CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+					ChangePeer: &raft_cmdpb.ChangePeerResponse{Region: region},
+				},
+			})
+			d.RaftGroup.ApplyConfChange(*cc)
+			return
+		}
+		region.RegionEpoch.ConfVer++
+		d.removePeerCache(cc.NodeId)
+	}
+
+	// Update storeMeta
+	meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+	d.peerStorage.SetRegion(region)
+	storeMeta := d.ctx.storeMeta
+	storeMeta.Lock()
+	storeMeta.regions[region.Id] = region
+	storeMeta.Unlock()
+
+	// Apply conf change to raft
+	d.RaftGroup.ApplyConfChange(*cc)
+
+	// Notify callback
+	d.notifyConfChangeCallback(entry, cc, &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+			ChangePeer: &raft_cmdpb.ChangePeerResponse{Region: region},
+		},
+	})
+
+	// Notify scheduler
+	if d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
+}
+
+func (d *peerMsgHandler) notifyConfChangeCallback(entry *eraftpb.Entry, cc *eraftpb.ConfChange, resp *raft_cmdpb.RaftCmdResponse) {
+	for len(d.proposals) > 0 {
+		p := d.proposals[0]
+		if p.term < entry.Term {
+			NotifyStaleReq(p.term, p.cb)
+			d.proposals = d.proposals[1:]
+			continue
+		}
+		if p.term > entry.Term || p.index > entry.Index {
+			break
+		}
+		if p.term == entry.Term && p.index == entry.Index {
+			if p.cb != nil {
+				p.cb.Done(resp)
+			}
+			d.proposals = d.proposals[1:]
+			break
+		}
+		d.proposals = d.proposals[1:]
+	}
 }
 
 func (d *peerMsgHandler) processAdminRequest(entry *eraftpb.Entry, msg *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
