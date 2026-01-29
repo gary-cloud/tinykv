@@ -53,9 +53,20 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	ready := d.RaftGroup.Ready()
 
 	// Save ready state to storage
-	_, err := d.peerStorage.SaveReadyState(&ready)
+	result, err := d.peerStorage.SaveReadyState(&ready)
 	if err != nil {
 		log.Panicf("%s save ready state error: %v", d.Tag, err)
+	}
+
+	// Update region info if snapshot was applied
+	if result != nil {
+		d.peerStorage.SetRegion(result.Region)
+		storeMeta := d.ctx.storeMeta
+		storeMeta.Lock()
+		storeMeta.regions[result.Region.Id] = result.Region
+		storeMeta.regionRanges.Delete(&regionItem{region: result.PrevRegion})
+		storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: result.Region})
+		storeMeta.Unlock()
 	}
 
 	// Send messages

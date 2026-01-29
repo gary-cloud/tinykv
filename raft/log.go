@@ -81,6 +81,16 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	first, _ := l.storage.FirstIndex()
+	if len(l.entries) > 0 {
+		if first > l.entries[0].Index {
+			if first > l.entries[len(l.entries)-1].Index {
+				l.entries = l.entries[:0]
+			} else {
+				l.entries = l.entries[first-l.entries[0].Index:]
+			}
+		}
+	}
 }
 
 // allEntries return all the entries not compacted.

@@ -205,7 +205,20 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevIndex := r.Prs[to].Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevIndex)
 	if err != nil {
-		return false
+		// Log has been compacted, send snapshot instead
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		if err != nil {
+			return false
+		}
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType:  pb.MessageType_MsgSnapshot,
+			To:       to,
+			From:     r.id,
+			Term:     r.Term,
+			Snapshot: &snapshot,
+		})
+		r.Prs[to].Next = snapshot.Metadata.Index + 1
+		return true
 	}
 	var entries []*pb.Entry
 	for i := r.Prs[to].Next; i <= r.RaftLog.LastIndex(); i++ {
@@ -394,6 +407,34 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	meta := m.Snapshot.Metadata
+	if meta.Index <= r.RaftLog.committed {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Index:   r.RaftLog.committed,
+		})
+		return
+	}
+	r.becomeFollower(max(r.Term, m.Term), m.From)
+	r.RaftLog.entries = nil
+	r.RaftLog.committed = meta.Index
+	r.RaftLog.applied = meta.Index
+	r.RaftLog.stabled = meta.Index
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.Prs = make(map[uint64]*Progress)
+	for _, peer := range meta.ConfState.Nodes {
+		r.Prs[peer] = &Progress{}
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Index:   r.RaftLog.LastIndex(),
+	})
 }
 
 // addNode add a new node to raft group
