@@ -150,7 +150,29 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 		}
 		return errEpochNotMatching
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	// Check if keys are in region
+	if req.Requests != nil {
+		for _, r := range req.Requests {
+			var key []byte
+			switch r.CmdType {
+			case raft_cmdpb.CmdType_Get:
+				key = r.Get.Key
+			case raft_cmdpb.CmdType_Put:
+				key = r.Put.Key
+			case raft_cmdpb.CmdType_Delete:
+				key = r.Delete.Key
+			}
+			if key != nil {
+				if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
@@ -160,6 +182,26 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+
+	// Handle TransferLeader specially - it doesn't need to go through Raft consensus
+	if msg.AdminRequest != nil && msg.AdminRequest.CmdType == raft_cmdpb.AdminCmdType_TransferLeader {
+		d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+		cb.Done(&raft_cmdpb.RaftCmdResponse{
+			Header: &raft_cmdpb.RaftResponseHeader{},
+			AdminResponse: &raft_cmdpb.AdminResponse{
+				CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+				TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+			},
+		})
+		return
+	}
+
+	// Handle ChangePeer specially - it needs to be proposed as a conf change
+	if msg.AdminRequest != nil && msg.AdminRequest.CmdType == raft_cmdpb.AdminCmdType_ChangePeer {
+		d.proposeConfChange(msg, cb)
+		return
+	}
+
 	// Serialize the request
 	data, err := msg.Marshal()
 	if err != nil {
@@ -177,6 +219,39 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 
 	// Propose to raft
 	err = d.RaftGroup.Propose(data)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+}
+
+func (d *peerMsgHandler) proposeConfChange(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	changePeer := msg.AdminRequest.ChangePeer
+
+	// Serialize the request as context
+	data, err := msg.Marshal()
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	// Create conf change
+	cc := eraftpb.ConfChange{
+		ChangeType: changePeer.ChangeType,
+		NodeId:     changePeer.Peer.Id,
+		Context:    data,
+	}
+
+	// Create proposal and save callback
+	p := &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	}
+	d.proposals = append(d.proposals, p)
+
+	// Propose conf change to raft
+	err = d.RaftGroup.ProposeConfChange(cc)
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
@@ -792,6 +867,8 @@ func (d *peerMsgHandler) processAdminRequest(entry *eraftpb.Entry, msg *raft_cmd
 			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 			d.ScheduleCompactLog(compactLog.CompactIndex)
 		}
+	case raft_cmdpb.AdminCmdType_Split:
+		d.processSplit(entry, msg, kvWB)
 	}
 	return kvWB
 }
@@ -867,4 +944,119 @@ func (d *peerMsgHandler) processNormalRequest(entry *eraftpb.Entry, msg *raft_cm
 	}
 
 	return kvWB
+}
+
+func (d *peerMsgHandler) processSplit(entry *eraftpb.Entry, msg *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) {
+	splitReq := msg.AdminRequest.Split
+	splitKey := splitReq.SplitKey
+	region := d.Region()
+
+	// Check region epoch
+	if err := util.CheckRegionEpoch(msg, region, true); err != nil {
+		log.Infof("%s split check region epoch failed: %v", d.Tag, err)
+		d.notifySplitCallback(entry, ErrResp(err))
+		return
+	}
+
+	// Check if split key is in region
+	if err := util.CheckKeyInRegion(splitKey, region); err != nil {
+		log.Infof("%s split key not in region: %v", d.Tag, err)
+		d.notifySplitCallback(entry, ErrResp(err))
+		return
+	}
+
+	// Create peers for new region
+	newPeers := make([]*metapb.Peer, 0, len(region.Peers))
+	for i, peer := range region.Peers {
+		newPeers = append(newPeers, &metapb.Peer{
+			Id:      splitReq.NewPeerIds[i],
+			StoreId: peer.StoreId,
+		})
+	}
+
+	// Create new region
+	newRegion := &metapb.Region{
+		Id:       splitReq.NewRegionId,
+		StartKey: splitKey,
+		EndKey:   region.EndKey,
+		RegionEpoch: &metapb.RegionEpoch{
+			ConfVer: 1,
+			Version: 1,
+		},
+		Peers: newPeers,
+	}
+
+	// Save old region for B-tree deletion (before modifying region)
+	oldRegion := &metapb.Region{
+		Id:       region.Id,
+		StartKey: region.StartKey,
+		EndKey:   region.EndKey,
+	}
+
+	// Update current region
+	region.EndKey = splitKey
+	region.RegionEpoch.Version++
+
+	// Persist region states
+	meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+
+	// Update peerStorage
+	d.peerStorage.SetRegion(region)
+
+	// Update storeMeta
+	storeMeta := d.ctx.storeMeta
+	storeMeta.Lock()
+	storeMeta.regionRanges.Delete(&regionItem{region: oldRegion})
+	storeMeta.regions[region.Id] = region
+	storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
+	storeMeta.regions[newRegion.Id] = newRegion
+	storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+	storeMeta.Unlock()
+
+	// Create and register new peer
+	peer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+	if err != nil {
+		log.Panicf("%s create peer for new region failed: %v", d.Tag, err)
+	}
+	d.ctx.router.register(peer)
+	d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
+
+	// Notify callback
+	d.notifySplitCallback(entry, &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: &raft_cmdpb.AdminResponse{
+			CmdType: raft_cmdpb.AdminCmdType_Split,
+			Split: &raft_cmdpb.SplitResponse{
+				Regions: []*metapb.Region{region, newRegion},
+			},
+		},
+	})
+
+	// Notify scheduler
+	if d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
+}
+
+func (d *peerMsgHandler) notifySplitCallback(entry *eraftpb.Entry, resp *raft_cmdpb.RaftCmdResponse) {
+	for len(d.proposals) > 0 {
+		p := d.proposals[0]
+		if p.term < entry.Term {
+			NotifyStaleReq(p.term, p.cb)
+			d.proposals = d.proposals[1:]
+			continue
+		}
+		if p.term > entry.Term || p.index > entry.Index {
+			break
+		}
+		if p.term == entry.Term && p.index == entry.Index {
+			if p.cb != nil {
+				p.cb.Done(resp)
+			}
+			d.proposals = d.proposals[1:]
+			break
+		}
+		d.proposals = d.proposals[1:]
+	}
 }
